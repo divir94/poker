@@ -2,7 +2,9 @@ import itertools
 import random
 import time
 import pprint
-import json
+import os
+import pandas as pd
+from typing import List
 
 
 class Game:
@@ -16,6 +18,7 @@ class Game:
         for _ in range(n):
             self.simulate()
         self.probabilities = {k: v for k, v in sorted(self.probabilities.items(), key=lambda prob: -prob[1].probability)}
+        self.store_probabilities()
 
     def simulate(self):
         self.deck.shuffle()
@@ -24,12 +27,26 @@ class Game:
         player_hands = [player.get_best_hand(self.deck.community_cards) for player in self.players]
         winning_hands = Hand.get_best_hand(player_hands)
         self.update_probabilities(player_hands, winning_hands)
-        return
 
     def update_probabilities(self, player_hands, winning_hands):
         for hand in player_hands:
             prob = self.probabilities.get(str(hand.hole_cards), Probability())
             self.probabilities[str(hand.hole_cards)] = prob.update(hand in winning_hands)
+
+    def store_probabilities(self):
+        path = os.path.join(os.path.dirname(__file__), '../data/probabilities.csv')
+        orig_df = pd.read_csv(path)
+        prob_df = pd.DataFrame(
+            [dict(players=self.num_players, hand=hand, new_won=prob.hands_won, new_played=prob.hands_played)
+             for hand, prob in game.probabilities.items()])
+        df = pd.merge(orig_df, prob_df, on=['players', 'hand'], how='outer')
+        df.fillna(0, inplace=True)
+        df['won'] = (df['won'] + df['new_won']).astype(int)
+        df['played'] = (df['played'] + df['new_played']).astype(int)
+        df['prob'] = df['won'] / df['played']
+        df = df[orig_df.columns].sort_values(['players', 'prob'], ascending=[True, False])
+        df.to_csv(path, index=False)
+        print('Stored probabilities')
 
 
 class Probability:
@@ -51,20 +68,20 @@ class Probability:
 
 class Player:
     def __init__(self):
-        self.hole_hands = []
+        self.hole_cards = None
 
     def __repr__(self):
-        return f"Player({self.hole_hands})"
+        return f"Player({self.hole_cards})"
 
     def get_best_hand(self, community_cards):
-        assert len(self.hole_hands) == 2, 'Hole cards have not been dealt!'
-        all_cards = self.hole_hands + community_cards
-        hands = [Hand(cards, self.hole_hands) for cards in itertools.combinations(all_cards, 5)]
+        assert self.hole_cards is not None, 'Hole cards have not been dealt!'
+        all_cards = self.hole_cards.cards + community_cards
+        hands = [Hand(cards, self.hole_cards) for cards in itertools.combinations(all_cards, 5)]
         return Hand.get_best_hand(hands)[0]
 
 
 class Card:
-    rank_map = {**dict({'Ace': 14, 'King': 13, 'Queen': 12, 'Jack': 11}), **dict(zip(range(2, 11), range(2, 11)))}
+    rank_map = {**dict({'A': 14, 'K': 13, 'Q': 12, 'J': 11, 'T': 10}), **dict(zip(range(2, 11), range(2, 11)))}
 
     def __init__(self, rank, suit):
         self.rank = rank
@@ -72,7 +89,7 @@ class Card:
         self.suit = suit
 
     def __repr__(self):
-        return f"({self.rank}, {self.suit})"
+        return f"{self.rank}{self.suit}"
 
     def __eq__(self, other):
         return self.rank_number == other.rank_number and self.suit == other.suit
@@ -81,9 +98,20 @@ class Card:
         return self.rank_number < other.rank_number
 
 
+class HoleCards:
+    def __init__(self, cards: List[Card]):
+        assert len(cards) == 2
+        self.cards = cards
+        self.cards.sort(reverse=True)
+        self.suited = cards[0].suit == cards[1].suit
+
+    def __repr__(self):
+        return f"{self.cards[0].rank}{self.cards[1].rank}{'s' if self.suited else 'o'}"
+
+
 class Deck:
-    ranks = list(range(2, 11)) + ['Ace', 'King', 'Queen', 'Jack']
-    suits = ['Spades', 'Clubs', 'Hearts', 'Diamonds']
+    ranks = list(range(2, 10)) + ['A', 'K', 'Q', 'J', 'T']
+    suits = ['s', 'c', 'h', 'd']
 
     def __init__(self):
         self.community_cards = []
@@ -93,7 +121,8 @@ class Deck:
 
     def deal_hole_cards(self, players):
         for player in players:
-            player.hole_hands = self.deal_cards(2)
+            cards = self.deal_cards(2)
+            player.hole_cards = HoleCards(cards)
 
     def deal_community_cards(self):
         self.community_cards = self.deal_cards(5)
@@ -148,7 +177,7 @@ class Hand:
                 return score
 
     def score_royal_flush(self):
-        return 10 if self.is_straight and self.is_flush and self.cards[0].rank == 'Ace' else 0
+        return 10 if self.is_straight and self.is_flush and self.cards[0].rank == 'A' else 0
 
     def score_straight_flush(self):
         return 9 + self.cards[0].rank_number / 100 if self.is_straight and self.is_flush else 0
@@ -232,7 +261,7 @@ class Hand:
 
 if __name__ == '__main__':
     game = Game(num_players=2)
-    num_games = 52 * 51 * 100
+    num_games = 13 * 13 * 2 * 10000
 
     start_time = time.time()
     game.run_simulations(num_games)
