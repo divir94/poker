@@ -261,7 +261,7 @@ class Hand:
 
 if __name__ == '__main__':
     game = Game(num_players=2)
-    num_games = 13 * 13 * 2 * 10000
+    num_games = 13 * 13 * 10000
 
     start_time = time.time()
     game.run_simulations(num_games)
