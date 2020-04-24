@@ -3,6 +3,8 @@ import random
 import time
 import pprint
 import os
+import multiprocessing as mp
+import collections
 import pandas as pd
 from typing import List
 
@@ -14,19 +16,29 @@ class Game:
         self.deck = Deck()
         self.probabilities = {}
 
-    def run_simulations(self, n):
-        for _ in range(n):
+    def run_simulations(self, n, result_queue):
+        for i in range(n):
+            if i % 1e5 == 0:
+                print(f"Running {i:,} / {n:,} simulations for {self.num_players} players.")
             self.simulate()
-        self.probabilities = {k: v for k, v in sorted(self.probabilities.items(), key=lambda prob: -prob[1].probability)}
-        self.store_probabilities()
+        result_queue.put(self)
 
     def simulate(self):
         self.deck.shuffle()
         self.deck.deal_hole_cards(self.players)
         self.deck.deal_community_cards()
-        player_hands = [player.get_best_hand(self.deck.community_cards) for player in self.players]
-        winning_hands = Hand.get_best_hand(player_hands)
+        player_hands = [player.get_hand(self.deck.community_cards) for player in self.players]
+        winning_hands = self.get_winning_hands(player_hands)
         self.update_probabilities(player_hands, winning_hands)
+
+    def print_probabilities(self):
+        print({k: v for k, v in sorted(self.probabilities.items(), key=lambda prob: -prob[1].probability)})
+
+    @staticmethod
+    def get_winning_hands(hands):
+        max_score = max(hand.score for hand in hands)
+        winning_hands = [hand for hand in hands if hand.score == max_score]
+        return winning_hands
 
     def update_probabilities(self, player_hands, winning_hands):
         for hand in player_hands:
@@ -38,15 +50,20 @@ class Game:
         orig_df = pd.read_csv(path)
         prob_df = pd.DataFrame(
             [dict(players=self.num_players, hand=hand, new_won=prob.hands_won, new_played=prob.hands_played)
-             for hand, prob in game.probabilities.items()])
+             for hand, prob in self.probabilities.items()])
+
         df = pd.merge(orig_df, prob_df, on=['players', 'hand'], how='outer')
         df.fillna(0, inplace=True)
         df['won'] = (df['won'] + df['new_won']).astype(int)
         df['played'] = (df['played'] + df['new_played']).astype(int)
         df['prob'] = df['won'] / df['played']
+        new_hands_played = int(df['new_played'].sum())
+        total_hands_played = df[df.players == self.num_players]['played'].sum()
+
         df = df[orig_df.columns].sort_values(['players', 'prob'], ascending=[True, False])
         df.to_csv(path, index=False)
-        print('Stored probabilities')
+
+        print(f"Players = {self.num_players}, New hands = {new_hands_played:,}, Total hands = {total_hands_played:,}.")
 
 
 class Probability:
@@ -69,21 +86,25 @@ class Probability:
 class Player:
     def __init__(self):
         self.hole_cards = None
+        self.hand = None
 
     def __repr__(self):
         return f"Player({self.hole_cards})"
 
-    def get_best_hand(self, community_cards):
+    def get_hand(self, community_cards):
         assert self.hole_cards is not None, 'Hole cards have not been dealt!'
         all_cards = self.hole_cards.cards + community_cards
-        hands = [Hand(cards, self.hole_cards) for cards in itertools.combinations(all_cards, 5)]
-        return Hand.get_best_hand(hands)[0]
+        self.hole_cards = HoleCards(self.hole_cards.cards)
+        self.hand = Hand(all_cards, self.hole_cards)
+        return self.hand
 
 
 class Card:
     rank_map = {**dict({'A': 14, 'K': 13, 'Q': 12, 'J': 11, 'T': 10}), **dict(zip(range(2, 11), range(2, 11)))}
 
     def __init__(self, rank, suit):
+        assert rank in Deck.ranks
+        assert suit in Deck.suits
         self.rank = rank
         self.rank_number = Card.rank_map[rank]
         self.suit = suit
@@ -140,23 +161,21 @@ class Deck:
 
 class Hand:
     def __init__(self, cards, hole_cards=None):
-        assert len(cards) == 5
+        assert len(cards) == 7
         self.cards = list(cards)
         self.cards.sort(reverse=True)
         self.hole_cards = hole_cards if hole_cards is not None else []
 
-        self.is_straight = self._is_straight()
-        self.is_flush = self._is_flush()
-        self.card_freq = self._get_card_freq()
+        self.straight_cards = self.get_straight_cards(self.cards)
+        self.straight_card_ranks = sorted(set([card.rank_number for card in self.straight_cards]), reverse=True)
+        self.flush_cards = self.get_flush_cards(self.cards)
+        self.straight_flush_cards = [card for card in self.straight_cards if card in self.flush_cards]
+        self.rank_counts = self.get_rank_counts(self.cards)  # map of cunts to list of ranks
+
         self.score = self.get_score()
 
     def __repr__(self):
         return f"Hand({self.cards})"
-
-    @staticmethod
-    def get_best_hand(hands):
-        max_score = max(hand.score for hand in hands)
-        return [hand for hand in hands if hand.score == max_score]
 
     def get_score(self):
         hand_order_functions = [
@@ -177,78 +196,125 @@ class Hand:
                 return score
 
     def score_royal_flush(self):
-        return 10 if self.is_straight and self.is_flush and self.cards[0].rank == 'A' else 0
+        if len(self.straight_flush_cards) >= 5 and self.straight_flush_cards[0].rank == 'A':
+            return 10
+        else:
+            return 0
 
     def score_straight_flush(self):
-        return 9 + self.cards[0].rank_number / 100 if self.is_straight and self.is_flush else 0
+        if len(self.straight_flush_cards) >= 5:
+            return 9 + self.straight_flush_cards[0].rank_number / 100
+        else:
+            return 0
 
     def score_four_of_a_kind(self):
-        card_rank = max(self.card_freq, key=self.card_freq.get)
-        other_card_rank = set(self.card_freq.keys()).difference([card_rank]).pop()
-        return 8 + card_rank / 1e2 + other_card_rank / 1e4 if 4 in self.card_freq.values() else 0
+        if 4 in self.rank_counts:
+            four_card_rank = self.rank_counts[4][0]
+            other_card_rank = max(card.rank_number for card in self.cards if card.rank_number != four_card_rank)
+            return 8 + four_card_rank / 1e2 + other_card_rank / 1e4
+        else:
+            return 0
 
     def score_full_house(self):
-        card_freqs = set(self.card_freq.values())
-        if 3 in card_freqs and 2 in card_freqs:
-            full_house_cards = [self._get_card_rank_with_freq(3), self._get_card_rank_with_freq(2)]
-            return 7 + full_house_cards[0] / 1e2 + full_house_cards[1] / 1e4
+        # check if we have 2 three of a kinds or 1 three of a kind and a pair
+        three_card_ranks = self.rank_counts[3]
+        pair_ranks = self.rank_counts[2]
+
+        if len(three_card_ranks) == 2 or (len(three_card_ranks) == 1 and len(pair_ranks) > 0):
+            other_three_card_rank = three_card_ranks[1] if len(three_card_ranks) == 2 else 0
+            pair_card_rank = pair_ranks[0] if len(pair_ranks) > 0 else 0
+            other_card_rank = max(other_three_card_rank, pair_card_rank)
+            assert other_card_rank > 0
+            return 7 + three_card_ranks[0] / 1e2 + other_card_rank / 1e4
         else:
             return 0
 
     def score_flush(self):
-        return 6 + Hand.get_cards_score(self.cards) if self.is_flush else 0
+        return 6 + Hand.get_cards_score(self.flush_cards[:5]) if len(self.flush_cards) >= 5 else 0
 
     def score_straight(self):
-        return 5 + Hand.get_cards_score(self.cards[0]) if self.is_straight else 0
+        return 5 + self.straight_cards[0].rank_number / 1e2 if len(self.straight_cards) >= 5 else 0
 
     def score_three_of_a_kind(self):
-        score = self._score_k_of_a_kind(3)
-        return 4 + score if score > 0 else 0
+        three_cards = self.rank_counts[3]
 
-    def score_two_pair(self):
-        pair_ranks = [rank_number for rank_number, freq in self.card_freq.items() if freq == 2]
-        if len(pair_ranks) == 0:
-            return 0
-        top_pair_rank = max(pair_ranks)
-        other_pair_rank = min(pair_ranks)
-        other_cards = [card for card in self.cards if card.rank_number not in pair_ranks]
-        return 3 + top_pair_rank / 1e2 + other_pair_rank / 1e4 + Hand.get_cards_score(other_cards) / 1e4
-
-    def score_one_pair(self):
-        score = self._score_k_of_a_kind(2)
-        return 2 + score if score > 0 else 0
-
-    def score_high_card(self):
-        return 1 + Hand.get_cards_score(self.cards)
-
-    def _is_straight(self):
-        for i, card in enumerate(self.cards[:4]):
-            if self.cards[i].rank_number - self.cards[i + 1].rank_number != 1:
-                return False
-        return True
-
-    def _is_flush(self):
-        suits = set(card.suit for card in self.cards)
-        return len(suits) == 1
-
-    def _get_card_freq(self):
-        card_freq = dict()
-        for card in self.cards:
-            card_freq[card.rank_number] = card_freq.get(card.rank_number, 0) + 1
-        return card_freq
-
-    def _get_card_rank_with_freq(self, freq):
-        return list(self.card_freq.keys())[list(self.card_freq.values()).index(freq)]
-
-    def _score_k_of_a_kind(self, k):
-        card_freqs = set(self.card_freq.values())
-        if k in card_freqs:
-            k_of_a_kind_card = self._get_card_rank_with_freq(k)
-            other_cards = [card for card in self.cards if card.rank_number != k_of_a_kind_card]
-            other_card_scores = Hand.get_cards_score(other_cards)
-            return self._get_card_rank_with_freq(k) / 100 + other_card_scores / 100
+        if len(three_cards) > 0:
+            high_cards = self.rank_counts[1]
+            assert len(high_cards) >= 2
+            return 4 + three_cards[0] / 1e2 + high_cards[0] / 1e4 + high_cards[1] / 1e6
         else:
             return 0
+
+    def score_two_pair(self):
+        pair_cards = self.rank_counts[2]
+
+        if len(pair_cards) >= 2:
+            high_cards = [card.rank_number for card in self.cards if card.rank_number not in pair_cards]
+            return 3 + pair_cards[0] / 1e2 + pair_cards[1] / 1e4 + high_cards[0] / 1e6
+        else:
+            return 0
+
+    def score_one_pair(self):
+        pair_cards = self.rank_counts[2]
+
+        if len(pair_cards) == 1:
+            high_cards = [card for card in self.cards if card.rank_number != pair_cards[0]]
+            return 2 + pair_cards[0] / 1e2 + Hand.get_cards_score(high_cards[:3]) / 1e2
+        else:
+            return 0
+
+    def score_high_card(self):
+        assert len(self.rank_counts[1]) >= 5
+        return 1 + Hand.get_cards_score(self.cards[:5])
+
+    @staticmethod
+    def get_straight_cards(cards):
+        # needs to take into account Ace high and low and pairs/trips etc.
+        max_len = 1
+        best_start_idx = 0
+        best_end_idx = 0
+        cur_start_idx = 0
+        cards = cards + [card for card in cards if card.rank == 'A']  # add copy of Aces to the end
+
+        for i, card in enumerate(cards):
+            if (
+                    (i == len(cards) - 1) or  # last card special case
+                    (cards[i].rank_number - cards[i + 1].rank_number > 1) and  # consecutive or same
+                    ~(cards[i].rank_number == 2 and cards[i + i].rank == 'A')  # low Ace special case
+            ):
+                seq_len = i - cur_start_idx + 1
+                if seq_len > max_len:
+                    max_len = seq_len
+                    best_start_idx = cur_start_idx
+                    best_end_idx = i
+                cur_start_idx = i + 1
+
+        return cards[best_start_idx:best_end_idx + 1]
+
+    @staticmethod
+    def get_flush_cards(cards):
+        # get cards of the suit with the highest frequency
+        suit_dict = {}
+        max_suit = None
+        max_suit_len = 0
+
+        for card in cards:
+            suit_cards = suit_dict.get(card.suit, []) + [card]
+            suit_dict[card.suit] = suit_cards
+            if len(suit_cards) > max_suit_len:
+                max_suit = card.suit
+                max_suit_len = len(suit_cards)
+
+        return suit_dict[max_suit]
+
+    @staticmethod
+    def get_rank_counts(cards):
+        rank_counts = collections.Counter([card.rank_number for card in cards])
+        count_ranks = collections.defaultdict(list)
+
+        for rank_number, count in sorted(rank_counts.items(), reverse=True):
+            count_ranks[count].append(rank_number)
+        return count_ranks
 
     @staticmethod
     def get_cards_score(cards):
@@ -260,13 +326,27 @@ class Hand:
 
 
 if __name__ == '__main__':
-    game = Game(num_players=2)
+    players = range(2, 6)
+    num_processes = len(players)
     num_games = 13 * 13 * 10000
 
     start_time = time.time()
-    game.run_simulations(num_games)
-    elapsed_time = time.time() - start_time
 
-    pprint.pprint(game.probabilities)
-    print(game.probabilities)
-    print(f"Took {elapsed_time:.2f}s for {num_games} simulations")
+    # run sims
+    result_queue = mp.Queue()
+    processes = [mp.Process(target=Game(3).run_simulations, args=(num_games, result_queue))
+                 for num_players in players]
+    for p in processes:
+        p.start()
+    for p in processes:
+        p.join()
+
+    # store result
+    result = [result_queue.get() for _ in processes]
+    for game in result:
+        game.store_probabilities()
+
+    # print stats
+    time_elapsed = time.time() - start_time
+    print(f"Took {time_elapsed:.1f}s for {num_games} simulations. {num_games / time_elapsed:.0f} games/s => "
+          f"{num_games / time_elapsed / 169:.1f} hands/s.")
